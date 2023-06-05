@@ -29,6 +29,7 @@
 #include <linux/sysfs.h>
 #include <linux/spi/spi.h>
 #include <linux/spi/spi-engine.h>
+#include <linux/util_macros.h>
 
 #define AD4630_REG_INTERFACE_CONFIG_A	0x00
 #define AD4630_REG_INTERFACE_CONFIG_B	0x01
@@ -82,6 +83,7 @@
 /* HARDWARE_GAIN */
 #define AD4630_REG_CHAN_GAIN(ch)	(AD4630_REG_GAIN_X0_MSB + 2 * (ch))
 #define AD4630_GAIN_MAX			1999970
+#define ADAQ4224_GAIN_MAX		6670000000
 /* POWER MODE*/
 #define AD4630_POWER_MODE_MSK		GENMASK(1, 0)
 #define AD4630_LOW_POWER_MODE		3
@@ -124,6 +126,14 @@ enum {
 	ID_AD4030_24,
 	ID_AD4630_16,
 	ID_AD4630_24,
+	ID_ADAQ4224,
+};
+
+/*
+ * Gains computed as fractions of 1000 so they can be expressed by integers.
+ */
+static const int ad4630_gains[4] = {
+	330, 560, 2220, 6670
 };
 
 struct ad4630_out_mode {
@@ -141,6 +151,7 @@ struct ad4630_chip_info {
 	u16 base_word_len;
 	u8 grade;
 	u8 n_channels;
+	bool has_pgia;
 };
 
 struct ad4630_state {
@@ -148,11 +159,13 @@ struct ad4630_state {
 	struct regulator_bulk_data regulators[3];
 	struct pwm_device *conv_trigger;
 	struct pwm_device *fetch_trigger;
+	struct gpio_descs *pgia_gpios;
 	struct spi_device *spi;
 	struct regmap *regmap;
 
 	int vref;
 	int vio;
+	int pgia_idx;
 	unsigned int out_data;
 	unsigned int max_rate;
 
@@ -279,6 +292,8 @@ static int ad4630_read_raw(struct iio_dev *indio_dev,
 		return IIO_VAL_INT;
 	case IIO_CHAN_INFO_SCALE:
 		*val = (st->vref * 2) / 1000;
+		if (st->chip->has_pgia)
+			*val = *val * ad4630_gains[st->pgia_idx] / 1000;
 		*val2 = chan->scan_type.realbits;
 		return IIO_VAL_FRACTIONAL_LOG2;
 	case IIO_CHAN_INFO_CALIBSCALE:
@@ -386,6 +401,69 @@ static int ad4630_set_chan_offset(struct iio_dev *indio_dev, int ch, int offset)
 	return ret;
 }
 
+static int ad4630_calc_pgia_gain(int gain_int, int gain_fract, int vref,
+				 int precision)
+{
+	int gain_idx;
+	u64 gain;
+
+	gain = gain_int * 1000000000 + gain_fract;
+
+	if (gain < 0 || gain > ADAQ4224_GAIN_MAX)
+		return -EINVAL;
+
+	gain = DIV_ROUND_CLOSEST_ULL(gain << precision, 1000000000);
+	gain = DIV_ROUND_CLOSEST_ULL(gain, (vref / 1000000) * 2);
+	gain_idx = find_closest(gain, ad4630_gains, ARRAY_SIZE(ad4630_gains));
+
+	return gain_idx;
+}
+
+static int ad4630_set_pgia_gain(struct iio_dev *indio_dev, int gain_idx)
+{
+	struct ad4630_state *st = iio_priv(indio_dev);
+	int ret, n_mux_pins = 2;
+
+	unsigned long *values = bitmap_alloc(n_mux_pins, GFP_KERNEL);
+	if(!values)
+		return -ENOMEM;
+
+	/* Set appropriate status for A0, A1 pins according to requested gain */
+	switch (gain_idx)
+	{
+	case 0:
+		bitmap_zero(values, n_mux_pins); /* Clear MUX_A0 and MUX_A1 pins */
+		break;
+	case 1:
+		bitmap_set(values, 0, 1);        /* Set MUX_A0 pin */
+		bitmap_clear(values, 1, 1);      /* Clear MUX_A1 pin */
+		break;
+	case 2:
+		bitmap_clear(values, 0, 1);      /* Clear MUX_A0 pin */
+		bitmap_set(values, 1, 1);        /* Set MUX_A1 pin */
+		break;
+	case 3:
+		bitmap_fill(values, n_mux_pins); /* Set MUX_A0 and MUX_A1 pins */
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	ret = gpiod_set_array_value_cansleep(n_mux_pins,
+					     st->pgia_gpios->desc,
+					     st->pgia_gpios->info, values);
+
+	bitmap_free(values);
+
+	if (ret)
+		dev_info(&st->spi->dev, "Error on gpiod set: %d\n", ret);
+
+	if (!ret)
+		st->pgia_idx = gain_idx;
+
+	return ret;
+}
+
 static int ad4630_set_chan_gain(struct iio_dev *indio_dev, int ch,
 				int gain_int, int gain_frac)
 {
@@ -412,13 +490,74 @@ static int ad4630_set_chan_gain(struct iio_dev *indio_dev, int ch,
 	return ret;
 }
 
+static ssize_t in_voltage_scale_available_show(struct device *dev,
+					       struct device_attribute *attr,
+					       char *buf)
+{
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+	struct ad4630_state *st = iio_priv(indio_dev);
+	int i, len = 0;
+	int val, val2;
+	int tmp0, tmp1;
+	s64 tmp2;
+
+	val2 = st->chip->base_word_len;
+
+	for (i = 0; i < ARRAY_SIZE(ad4630_gains); i++) {
+		val = (st->vref * 2) / 1000;
+		if (st->chip->has_pgia)
+			val = val * ad4630_gains[i] / 1000;
+
+		tmp2 = shift_right((s64)val * 1000000000LL, val2);
+		tmp0 = (int)div_s64_rem(tmp2, 1000000000LL, &tmp1);
+
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+			"%d.%09u ", tmp0, abs(tmp1));
+	}
+	buf[len - 1] = '\n';
+
+	return len;
+}
+
+static IIO_DEVICE_ATTR_RO(in_voltage_scale_available, 0);
+
+static struct attribute *ad4630_attributes[] = {
+	&iio_dev_attr_in_voltage_scale_available.dev_attr.attr,
+	NULL
+};
+
+static const struct attribute_group ad4630_attribute_group = {
+	.attrs = ad4630_attributes,
+};
+
+static int adaq4224_write_raw_get_fmt(struct iio_dev *indio_dev,
+				      struct iio_chan_spec const *chan,
+				      long mask)
+{
+	switch (mask) {
+	case IIO_CHAN_INFO_SCALE:
+		return IIO_VAL_INT_PLUS_NANO;
+	default:
+		return IIO_VAL_INT_PLUS_MICRO;
+	}
+
+	return -EINVAL;
+}
+
 static int ad4630_write_raw(struct iio_dev *indio_dev,
 			    struct iio_chan_spec const *chan, int val,
 			    int val2, long info)
 {
+	struct ad4630_state *st = iio_priv(indio_dev);
+	int gain_idx;
+
 	switch (info) {
 	case IIO_CHAN_INFO_SAMP_FREQ:
 		return ad4630_set_sampling_freq(indio_dev, val);
+	case IIO_CHAN_INFO_SCALE:
+		gain_idx = ad4630_calc_pgia_gain(val, val2, st->vref,
+						 chan->scan_type.realbits);
+		return ad4630_set_pgia_gain(indio_dev, gain_idx);
 	case IIO_CHAN_INFO_CALIBSCALE:
 		return ad4630_set_chan_gain(indio_dev, chan->channel, val,
 					    val2);
@@ -771,6 +910,18 @@ static const struct ad4630_chip_info ad4630_chip_info[] = {
 		.max_offset = BIT(23) - 1,
 		.base_word_len = 24,
 		.n_channels = 2,
+	},
+	[ID_ADAQ4224] = {
+		.available_masks = ad4030_channel_masks,
+		.modes = ad4030_24_modes,
+		.out_modes_mask = GENMASK(3, 0),
+		.name = "adaq4224",
+		.grade = 0x10,   /* !FIXME: To be updated with the value from datasheet */
+		.min_offset = (int)BIT(23) * -1,
+		.max_offset = BIT(23) - 1,
+		.base_word_len = 24,
+		.has_pgia = true,
+		.n_channels = 1,
 	}
 };
 
@@ -1077,6 +1228,14 @@ static const struct iio_info ad4630_info = {
 	.debugfs_reg_access = &ad4630_reg_access,
 };
 
+static const struct iio_info adaq4224_info = {
+	.read_raw = &ad4630_read_raw,
+	.write_raw = &ad4630_write_raw,
+	.write_raw_get_fmt = &adaq4224_write_raw_get_fmt,
+	.debugfs_reg_access = &ad4630_reg_access,
+	.attrs = &ad4630_attribute_group,
+};
+
 static const struct regmap_bus ad4630_regmap_bus = {
 	.read = ad4630_spi_read,
 	.write = ad4630_spi_write,
@@ -1243,6 +1402,18 @@ static int ad4630_probe(struct spi_device *spi)
 	if (ret)
 		return ret;
 
+	if (st->chip->has_pgia) {
+		st->pgia_gpios = devm_gpiod_get_array_optional(&spi->dev,
+							       "adi,pgia",
+							       GPIOD_OUT_LOW);
+
+		if (IS_ERR(st->pgia_gpios))
+			dev_err_probe(&spi->dev, PTR_ERR(st->pgia_gpios),
+				      "Failed to get PGIA GPIOs\n");
+
+		ad4630_set_pgia_gain(indio_dev, 0);
+	}
+
 	ret = ad4630_reset(st);
 	if (ret)
 		return ret;
@@ -1256,7 +1427,11 @@ static int ad4630_probe(struct spi_device *spi)
 		return ret;
 
 	indio_dev->name = st->chip->name;
-	indio_dev->info = &ad4630_info;
+	if (st->chip->has_pgia)
+		indio_dev->info = &adaq4224_info;
+	else
+		indio_dev->info = &ad4630_info;
+
 	indio_dev->channels = st->chip->modes[st->out_data].channels;
 	indio_dev->num_channels = st->chip->n_channels;
 	indio_dev->modes = INDIO_BUFFER_HARDWARE;
@@ -1323,6 +1498,7 @@ static const struct spi_device_id ad4630_id_table[] = {
 	{ "ad4030-24", (kernel_ulong_t)&ad4630_chip_info[ID_AD4030_24] },
 	{ "ad4630-16", (kernel_ulong_t)&ad4630_chip_info[ID_AD4630_16] },
 	{ "ad4630-24", (kernel_ulong_t)&ad4630_chip_info[ID_AD4630_24] },
+	{ "adaq4224", (kernel_ulong_t)&ad4630_chip_info[ID_ADAQ4224] },
 	{ "ad463x", (kernel_ulong_t)&ad463x_chip_info },
 	{}
 };
@@ -1332,6 +1508,7 @@ static const struct of_device_id ad4630_of_match[] = {
 	{ .compatible = "adi,ad4630-24", .data = &ad4630_chip_info[ID_AD4030_24] },
 	{ .compatible = "adi,ad4630-16", .data = &ad4630_chip_info[ID_AD4630_16] },
 	{ .compatible = "adi,ad4030-24", .data = &ad4630_chip_info[ID_AD4630_24] },
+	{ .compatible = "adi,adaq4224", .data = &ad4630_chip_info[ID_ADAQ4224] },
 	{ .compatible = "adi,ad463x", .data = &ad463x_chip_info},
 	{}
 };
